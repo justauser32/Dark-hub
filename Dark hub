@@ -1,79 +1,140 @@
-local PathfindingService = game:GetService("PathfindingService")
+-- Auto hit for paintball: when an enemy is in your crosshair, auto-fires the gun
+-- Paste in executor (Roblox Lua)
+
 local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
 local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
 
 local player = Players.LocalPlayer
+local camera = Workspace.CurrentCamera
 
-local PATHS = {
-    ["Left"] = {
-        [1] = Vector3.new(-474.84, -6.90, 94.42),
-        [2] = Vector3.new(-483.80, -5.00, 94.67),
-        [3] = Vector3.new(-476.83, -6.12, 94.54),
-        [4] = Vector3.new(-475.10, -6.90, 31.84),
-    },
-    ["Right"] = {
-        [1] = Vector3.new(-473.19, -6.90, 28.00),
-        [2] = Vector3.new(-482.12, -4.94, 25.57),
-        [3] = Vector3.new(-475.88, -6.67, 25.20),
-        [4] = Vector3.new(-474.33, -6.90, 92.96),
-    }
-}
+-- Config
+local FIRE_RATE = 0.15          -- seconds between shots (lower = faster)
+local MAX_RANGE = 500           -- studs
+local HEAD_SIZE = 2             -- ray radius / hitbox (studs) for "in crosshair" check
+local TOOL_NAMES = { "Paintball Gun" } -- from your game (ReplicatedStorage.Items.Paintball Gun)
 
-local function getMyPlotInfo()
-    local char = player.Character
-    local root = char and char:FindFirstChild("HumanoidRootPart")
-    if not root then return nil, nil end
-    local plots = workspace:FindFirstChild("Plots")
-    if not plots then return nil, nil end
-    local id = player:GetAttribute("PlotId") or player:GetAttribute("PlotID")
-    local myPlot = plots:FindFirstChild(tostring(id))
-    if not myPlot then
-        local closest = nil
-        local dist = 100
-        for _, p in pairs(plots:GetChildren()) do
-            local ref = p:FindFirstChild("StealHitbox") or p:FindFirstChild("MainRoot")
-            if ref and (root.Position - ref.Position).Magnitude < dist then
-                dist = (root.Position - ref.Position).Magnitude
-                myPlot = p
-            end
-        end
-    end
-    if not myPlot then return nil, nil end
-    local refPart = myPlot:FindFirstChild("StealHitbox") or myPlot:FindFirstChild("MainRoot")
-    local mySide = "Left"
-    if refPart and refPart.Position.Z < 60 then 
-        mySide = "Right" 
-    end
-    return myPlot.Name, mySide
+local lastShot = 0
+local toolMatch = nil
+
+local function getToolName(tool)
+	if not tool or not tool:IsA("Tool") then return nil end
+	local n = tool.Name:lower()
+	for _, name in ipairs(TOOL_NAMES) do
+		if n:find(name:lower()) then return tool.Name end
+	end
+	-- If no match, use first tool that looks like a gun (optional: remove and only use TOOL_NAMES)
+	return nil
 end
 
-local function walkTo(targetPos)
-    local char = player.Character
-    local hum = char and char:FindFirstChild("Humanoid")
-    local root = char and char:FindFirstChild("HumanoidRootPart")
-    if not hum or not root then return end
-    hum:MoveTo(targetPos)
-    local startTime = tick()
-    repeat 
-        task.wait(0.1)
-        if tick() - startTime > 5 then
-            hum.Jump = true
-            hum:MoveTo(targetPos)
-            startTime = tick()
-        end
-    until (root.Position - targetPos).Magnitude < 4
+local function getPaintballTool()
+	local char = player.Character
+	if not char then return nil end
+	local tool = char:FindFirstChildOfClass("Tool")
+	if tool and getToolName(tool) then return tool end
+	-- Check backpack for when we need to know the name
+	local backpack = player:FindFirstChild("Backpack")
+	if backpack then
+		for _, t in ipairs(backpack:GetChildren()) do
+			if t:IsA("Tool") and getToolName(t) then return t end
+		end
+	end
+	return nil
 end
 
-local function runAutoplay()
-    local plotId, mySide = getMyPlotInfo()
-    if plotId and mySide then
-        local targetSide = (mySide == "Left") and "Right" or "Left"
-        local waypoints = PATHS[targetSide]
-        for i = 1, #waypoints do
-            walkTo(waypoints[i])
-            task.wait(0.1)
-        end
-    end
+-- Is this character an enemy (not us, not dead)?
+local function isEnemy(char)
+	if not char or char == player.Character then return false end
+	local hum = char:FindFirstChild("Humanoid")
+	local root = char:FindFirstChild("HumanoidRootPart")
+	return hum and hum.Health > 0 and root
 end
 
-task.spawn(runAutoplay)
+-- Get enemy character from raycast result (hit part's ancestor that is a Model with Humanoid)
+local function getEnemyFromHit(hitPart)
+	if not hitPart then return nil end
+	local model = hitPart:FindFirstAncestorOfClass("Model")
+	if not model then return nil end
+	local hum = model:FindFirstChild("Humanoid")
+	if not hum then return nil end
+	local play = Players:GetPlayerFromCharacter(model)
+	-- Only count player characters as enemies (not NPCs unless you want them)
+	if play and play ~= player and hum.Health > 0 then return model end
+	return nil
+end
+
+-- Raycast from screen center; returns enemy character if one is in crosshair
+local function getEnemyInCrosshair()
+	local cam = camera
+	if not cam then return nil end
+	local unit = cam.CFrame.LookVector
+	local origin = cam.CFrame.Position
+	local ray = RaycastParams.new()
+	ray.FilterType = Enum.RaycastFilterType.Exclude
+	ray.FilterDescendantsInstances = { player.Character or {} }
+	local list = {}
+	if player.Character then table.insert(list, player.Character) end
+	ray.FilterDescendantsInstances = list
+
+	local result = Workspace:Raycast(origin, unit * MAX_RANGE, ray)
+	if not result then return nil end
+	return getEnemyFromHit(result.Instance)
+end
+
+-- Fire the tool: try VirtualUser click (triggers Activated) or tool remote
+local function tryFire()
+	local char = player.Character
+	if not char then return end
+	local tool = char:FindFirstChildOfClass("Tool")
+	if not tool or not getToolName(tool) then return end
+
+	-- 1) VirtualUser simulates click -> tool Activated fires
+	local vu = game:GetService("VirtualUser")
+	if vu then
+		pcall(function()
+			vu:ClickButton1(Vector2.new(0, 0), camera.CFrame)
+		end)
+		return
+	end
+
+	-- 2) Try common remote names inside the tool
+	local remotes = { "Fire", "Shoot", "FireServer", "FireRemote", "ShootRemote" }
+	for _, name in ipairs(remotes) do
+		local r = tool:FindFirstChild(name)
+		if r and (r:IsA("RemoteEvent") or r:IsA("RemoteFunction") or r:IsA("BindableEvent") or r:IsA("BindableFunction")) then
+			if r:IsA("RemoteEvent") or r:IsA("BindableEvent") then
+				pcall(function() r:FireServer() end)
+			else
+				pcall(function() r:InvokeServer() end)
+			end
+			return
+		end
+	end
+end
+
+-- Main loop: if paintball tool equipped and enemy in crosshair, fire at rate
+RunService.RenderStepped:Connect(function()
+	local char = player.Character
+	if not char then return end
+	local tool = char:FindFirstChildOfClass("Tool")
+	if not tool or not getToolName(tool) then return end
+
+	local enemy = getEnemyInCrosshair()
+	if not enemy then return end
+
+	local now = tick()
+	if now - lastShot < FIRE_RATE then return end
+	lastShot = now
+	tryFire()
+end)
+
+-- Optional: also fire when holding right mouse (aim) and enemy in crosshair
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then return end
+	if input.UserInputType ~= Enum.UserInputType.MouseButton2 then return end
+	-- Keep firing while holding if you want; for now RenderStepped handles it
+end)
+
+print("Auto hit paintball loaded. Equip your paintball gun and look at enemies to auto-fire.")
+print("Config: FIRE_RATE=" .. FIRE_RATE .. "s, MAX_RANGE=" .. MAX_RANGE .. " studs. Edit TOOL_NAMES if your gun has a different name.")
